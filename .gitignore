@@ -5,6 +5,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg
 
 # ── 虚拟环境 ──────────────────────────────────────────────
 # review-engine/.venv 里有几千个文件，进库会让每次 git status 都变慢
@@ -18,27 +23,45 @@ env/
 .env.*
 !.env.example
 !*.env.example
+*.pem
+*.p12
+*.pfx
 
-# ── IDE ──────────────────────────────────────────────────
+# ── IDE / 本地工具 ───────────────────────────────────────
 .idea/
 .vscode/
 *.iml
+# AI 助手的本地工作区记忆与日志，仅本机使用，不入库
+.workbuddy/
 
 # ── 运行产物 ──────────────────────────────────────────────
 logs/
 *.log
+*.tmp
+*.swp
+*~
+*.bak
 
-# ── 解析中间产物 ──────────────────────────────────────────
-# MinerU 每份标书会写 markdown + 图片 + 版面 JSON，几个 GB 起。
-# 实际位置是 data/_mineru（ParseConfig.mineru_work_dir 由 parsed_dir 的上一级派生）
-data/_mineru/
-data/parsed/_mineru/
+# ── 数据目录：采集原件 / 解析产物 / 中间件运行态 ───────────
+# data/raw 是 140+ 份原始招标文件（PDF/ZIP/DOC，约 143MB），属本地采集数据，
+# 不是源码，也不适合放进公开仓库；data/parsed 与 _mineru 是 MinerU 解析产物，
+# 会随运行增长到数 GB。全部保留在本地，只把目录骨架和少量文本说明入库。
+/data/raw/
+/data/parsed/*
+!/data/parsed/.gitkeep
+/data/_mineru/
+/data/parsed/_mineru/
+/data/minio/
+/data/loki/
+/data/alloy/
+/data/*.html
 
-# ── 系统文件 ──────────────────────────────────────────────
+# ── Java / Spring Boot ───────────────────────────────────
+target/
+.gradle/
+*.class
+
+# ── 系统文件 ─────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-# ── 观测栈运行态 ─────────────────────────────────────────
-# Loki 的 chunk/WAL 和 Alloy 的本地存储是运行时数据，会被自己轮转删除
-data/loki/
-data/alloy/
+desktop.ini
