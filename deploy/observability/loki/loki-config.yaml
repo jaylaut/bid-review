@@ -1,0 +1,55 @@
+# Loki 单机（single binary）配置 —— 日志存储与查询
+# 位置：deploy/observability/loki/loki-config.yaml
+# 参考：Loki 3.7.x 的最小可用单机配置（TSDB 索引 + 本地文件存储 + 14 天保留）
+#
+# 三处必须理解，否则会"配了不生效"：
+#   1. schema v13 + store tsdb：3.x 的默认索引；boltdb-shipper 已废弃，新部署不要用
+#   2. limits_config.retention_period 只是"声明保留多久"，真正删数据要靠 compactor
+#      （下面的 retention_enabled: true），少任何一半都会无限增长
+#   3. 单机模式必须 replication_factor: 1 + inmemory ring，照抄分布式参数会起不来
+
+auth_enabled: false                   # 单机不开多租户；开的话所有请求都要带 X-Scope-OrgID
+
+server:
+  http_listen_port: 3100              # 查询/写入都走这个端口（/loki/api/v1/*）
+  grpc_listen_port: 9096
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki                  # 容器内路径，由 compose 映射到宿主机 data/loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2026-01-01                # 新建集群取"今天之前"的日期即可，不随运行时间变
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 336h              # 14 天，与 review-engine/.env 的 LOG_BACKUP_DAYS 对齐
+  reject_old_samples: true            # 拒绝时间戳过旧的数据：防止采集器回放历史文件把库撑爆
+  reject_old_samples_max_age: 168h
+  max_query_series: 5000              # 单次查询的流上限，超了报错而不是把 Loki 拖死
+  allow_structured_metadata: true     # 关键开关：task_id/trace_id 走 structured metadata 的前提
+  volume_enabled: true                # 让 Grafana 能显示"每个流占多少量"
+
+compactor:
+  working_directory: /loki/compactor
+  delete_request_store: filesystem    # 3.x 必填（保留策略删数据也要一个 store）
+  retention_enabled: true             # 没有这一行，上面的 retention_period 永远不生效
+  compaction_interval: 10m
+
+analytics:
+  reporting_enabled: false            # 内网/生产部署：禁止外联上报

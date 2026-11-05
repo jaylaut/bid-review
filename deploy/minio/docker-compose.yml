@@ -1,0 +1,38 @@
+# MinIO 对象存储 —— Docker Compose 编排配置
+# 位置：deploy/minio/docker-compose.yml
+#
+# 启动：   docker compose up -d
+# 停止：   docker compose down
+# 查看日志：docker compose logs -f minio
+#
+# 说明：
+#   - 单节点部署，控制台(Web UI)端口 9001，S3 API 端口 9000
+#   - 数据与配置均持久化到宿主机 E:/project/bid-review/data/minio，容器删除后数据不丢
+#   - 账号密码通过同目录 .env 文件注入，请勿把明文写进本文件
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: bid-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      # 账号密码来自 .env（MinIO 要求 root 密码至少 8 位）
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # 可选：服务端区域（影响 SDK 签名，默认 us-east-1）
+      MINIO_REGION: ${MINIO_REGION:-cn-north-1}
+    ports:
+      # S3 API 端口（SDK/程序接入用）
+      - "9000:9000"
+      # 管理控制台端口（浏览器访问 http://localhost:9001）
+      - "9001:9001"
+    volumes:
+      # 对象数据目录（宿主 Windows 路径用 Docker Desktop 自动映射）
+      - E:/project/bid-review/data/minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

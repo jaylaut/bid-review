@@ -1,0 +1,113 @@
+// Grafana Alloy 采集配置 —— 宿主机日志文件 → 解析 → Loki
+// 位置：deploy/observability/alloy/config.alloy
+// 查询：http://localhost:12345（Alloy 自带 Web UI，先看这里能立刻判断"采集通不通"）
+//
+// 为什么是文件而不是 docker socket：
+//   Python 进程跑在宿主机（见 deploy/docker-compose.yaml 开头的说明），不是容器，
+//   docker_sd 里只有 PG/Redis，采不到业务日志。所以采集源是宿主机
+//   review-engine/logs/review-engine.log（由 compose 挂到 /var/log/bid-review）。
+//   生产容器化后，把下方"容器采集"整段启用、文件版停用即可，解析链完全复用。
+//
+// 为什么 Promtail 配置不能直接用：
+//   Promtail 已于 2026-03-02 EOL，Loki 3.7.3 起镜像内已移除该组件。
+//   Alloy 是唯一受支持的替代，配置语言也不同（components，不是 YAML scrape_configs）。
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ── 采集源：宿主机日志文件 ────────────────────────────────────
+// 路径与 Loki 地址走环境变量，同一份配置同时服务两种形态：
+//   容器（compose）：LOG_PATH=/var/log/bid-review/review-engine.log，LOKI_URL=http://loki:3100/...
+//   Windows 二进制：LOG_PATH=E:/project/bid-review/review-engine/logs/review-engine.log，
+//                   LOKI_URL=http://localhost:3100/...
+// 【why 不做两份配置】两份必然漂移；漂移的采集配置比没有采集更难查（现象是"某些字段时有时无"）。
+local.file_match "review_engine" {
+  path_targets = [{
+    __path__ = coalesce(sys.env("LOG_PATH"), "/var/log/bid-review/review-engine.log"),
+    job      = "review-engine",
+    service  = "review-engine",
+  }]
+  // 【坑】Windows 上宿主机目录以 bind mount 进容器后，inotify 事件可能丢失，
+  // 表现为"写日志了但 Alloy 没反应"。遇到这种情况改成容器化部署（下方容器采集段），
+  // 或在 Windows 上直接跑 alloy.exe 采本地文件（agent 与被采进程同机，本就是标准形态）。
+}
+
+loki.source.file "review_engine" {
+  targets    = local.file_match.review_engine.targets
+  forward_to = [loki.process.json.receiver]
+}
+
+// ── 解析：JSON → label / structured metadata ──────────────────
+// 字段名与 review-engine/src/common/logging.py 的输出严格对齐（改字段必须同步这里）
+loki.process "json" {
+  stage.json {
+    expressions = {
+      level    = "level",
+      event    = "event",
+      service  = "service",
+      env      = "env",
+      trace_id = "trace_id",
+      task_id  = "task_id",
+      item_id  = "item_id",
+    }
+  }
+
+  // 【纪律】label 只放低基数、稳定枚举的字段：level / event / service / env / job
+  // 为什么：Loki 的每个 label 组合 = 一条独立的流（stream），label 高基数会让索引爆炸、
+  // 查询变慢、内存打满。task_id 每个任务唯一 → 做成 label 就是"一个任务一条流"。
+  stage.labels {
+    values = {
+      level   = "",
+      event   = "",
+      service = "",
+      env     = "",
+    }
+  }
+
+  // task_id / item_id / trace_id 走 Loki 3.x 的 structured metadata：
+  // 能被查询条件过滤（{service="review-engine"} | task_id="t-1"），但不进索引。
+  stage.structured_metadata {
+    values = {
+      task_id  = "",
+      item_id  = "",
+      trace_id = "",
+    }
+  }
+
+  // 非 JSON 行（uvicorn 启动横幅、原生 traceback）不会报错，会被原样转发，
+  // 只是没有 level/event 标签——查问题时用 {service="review-engine"} 兜底即可。
+
+  forward_to = [loki.write.local.receiver]
+}
+
+// ── 写入 Loki ────────────────────────────────────────────────
+loki.write "local" {
+  endpoint {
+    url = coalesce(sys.env("LOKI_URL"), "http://loki:3100/loki/api/v1/push")
+  }
+  // 生产加多副本时在这里挂第二个 endpoint，Loki 侧负责去重
+}
+
+// ── 生产（容器化）采集：把上面的 local.file_match + loki.source.file 换成这一段 ──
+// 同时 compose 里要给 alloy 挂 /var/run/docker.sock 并去掉日志目录挂载。
+//
+// discovery.docker "containers" {
+//   host = "unix:///var/run/docker.sock"
+// }
+//
+// discovery.relabel "app" {
+//   targets = []
+//   rule {
+//     source_labels = ["__meta_docker_container_name"]
+//     regex         = "/(review-engine|bid-.*)"
+//     action        = "keep"
+//   }
+// }
+//
+// loki.source.docker "app" {
+//   host       = "unix:///var/run/docker.sock"
+//   targets    = discovery.relabel.app.output
+//   forward_to = [loki.process.json.receiver]
+// }

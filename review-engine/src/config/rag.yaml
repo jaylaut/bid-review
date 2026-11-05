@@ -1,0 +1,58 @@
+rag:
+  offline:                                         # 离线侧:建库、入库相关配置
+    parsing:                                       # 解析阶段
+      router: {scanned_threshold: 0.05}            # 扫描件判断阈值，< 0.05 判定为扫描件
+      backends: {default: mineru, scanned: mineru-vlm}  # 默认用mineru，扫描件用mineru-vlm
+      probe: {pages: 10}                           # 路由探针抽前 10 页判扫描件
+      mineru: {timeout_s: 900}                     # 单份解析超时 15 分钟，卡死就判失败而不是挂住整批
+      source:                                      # 主文件挑选规则：一个项目目录里通常有好几个文件
+        suffixes: [".pdf", ".docx", ".doc", ".txt", ".md"]        # 有资格当主文件的后缀
+        exclude_names: ["source.txt"]                             # 下载脚本写的元数据，不是标书正文
+        main_keywords: ["招标文件", "磋商文件", "采购文件", "谈判文件", "询价文件"]  # 命中基本可确定是主文件
+        aux_keywords: ["公告", "承诺函", "委托代理", "合同", "清单", "附件"]        # 命中就降权，但不排除
+      quality_gate:                                # 语料质量门禁：四个维度各 2 分，总分 0~8
+        min_score: 6                               # 及格线，低于 6 分进人工复核队列（R7 标定，能否调高待定）
+        sample_rate: 0.05                          # 人工抽检率 5%
+        thresholds:                                # 各维度判定阈值：代码里不得再出现这些数字（R0 铁律）
+          encoding: {replacement_warn: 5, garbage_lines_warn: 5, garbage_ratio: 0.3}  # 替换符上限/乱码行上限/行内不可读字符占比
+          length: {min_chars_full: 2000, min_chars_partial: 200}                     # 内容充实下限/内容偏少下限
+          structure: {min_headers_full: 3, min_headers_partial: 1}                   # 标题充足下限/标题稀疏下限
+          watermark: {residue_warn: 3}                                               # 水印可容忍残留处数
+    cleaning:                                      # 清洗阶段
+      dedupe: {exact: true, near: {method: minhash,threshold: 0.85}}  # 精确去重开；近似去重用 minhash，相似度>0.85 去重
+    chunking:                                      # 分块阶段
+      strategy: structural_recursive               # 分块策略：结构化递归
+      max_tokens: 512                              # 子块最大token数
+      overlap_tokens: 64                           # 块之间重叠token数，保证上限连续
+      parent_max_tokens: 2000                      # 父块最大token数
+      special: {table: whole,caption: standalone}  # 表格整块、图注独立成块
+    embedding:                                     # 嵌入阶段
+      provider: ollama                             # 嵌入服务商
+      model: qwen3-embedding:0.6b                  # 嵌入模型
+      dim: 1024                                    # 向量维度
+      distance: ip                                 # 距离算子： 内积（向量已归一化）
+      query_instruction: "Instruct: 检索投标技术方案中响应以下技术要求的段落\nQuery: "  # 查询侧指令，哈希进版本号
+      serving: {endpoint: "http://localhost:11434", batch_size: 32, num_ctx: 1024}  # Ollama 地址、批大小、上下文长度
+    indexing:                                     # 建索引阶段
+      hnsw: { m: 16, ef_construction: 200, ef_search: 128 }     # HNSW 参数
+      reconcile: { cron: "0 3 * * *", alert_threshold: 0.001 }  # 每天 3 点核对；差异>0.1% 告警
+    online: # 在线侧：检索/重排相关配置
+      retrieve: # 检索（R4/R5）
+        dense_k: 60                           # 向量路召回数量
+        sparse_k: 60                          # 全文路召回数量
+        fuse: { method: rrf, k: 60, pool: 100 } # 融合方法 RRF，常量 k=60，候选池 100
+        sparse_weight: 1.0                    # 稀疏路权重；型号漏检时升 1.2（R7 实验）
+      rerank: # 重排（R5）
+        provider: ollama-qwen3                # 重排服务商
+        model: dengcao/Qwen3-Reranker-0.6B:Q8_0  # 重排模型
+        candidates: 20                        # 进入重排的候选数
+        top_n: 5                              # 重排后保留数
+        refusal_threshold: 0.15              # 拒答阈值，R7 标定（非拍脑袋）
+        fallback: cloud_then_rrf              # 本地重排失败兜底：先云端，再退回 RRF
+      assemble: # 上下文拼接（R6）
+        context_budget_tokens: 6000           # 上下文 token 预算
+        order: u_shape                         # 拼接顺序：U 型（相关块优先）
+      cache: # 缓存
+        l1_ttl: 24h                           # 一级缓存存活 24 小时
+        l2_ttl: 168h                          # 二级缓存存活 7 天
+        l3_enabled: true                      # 三级缓存开关

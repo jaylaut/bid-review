@@ -1,0 +1,92 @@
+[project]
+name = "review-engine"
+version = "0.1.0"
+description = "招投标技术方案评审引擎（RAG + Agent，全程自研，不使用 LangChain/LangGraph）"
+requires-python = ">=3.12,<3.13"
+
+# 依赖策略：只写"至少哪个版本"，不锁死精确版本。
+# 理由：uv 会解析出一份 uv.lock 精确锁定，pyproject 里再写死版本号只会增加冲突概率。
+dependencies = [
+    # ── Web / API ────────────────────────────────────────────────
+    "fastapi>=0.115",            # 同步查询接口（评审追问、健康检查）
+    "uvicorn[standard]>=0.30",   # ASGI 服务器；Windows 上自动跳过 uvloop
+    # ── 数据校验与配置 ──────────────────────────────────────────
+    "pydantic>=2.8",             # 契约的强制执行者（Verdict / AgentState）
+    "pydantic-settings>=2.4",    # .env → 配置对象
+    # ── 数据库 ──────────────────────────────────────────────────
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.29",             # PG 异步驱动
+    "pgvector>=0.3",             # 向量类型在 asyncpg 侧的编解码注册
+    # ── LLM / Ollama 客户端（httpx 手写，不用 litellm / openai SDK）──
+    "httpx>=0.27",
+    "tenacity>=9.0",             # 429 / 超时的指数退避重试
+    # ── 消息队列 ────────────────────────────────────────────────
+    # RocketMQ 5.x：自研 gRPC 客户端（不用官方 rocketmq-client-python，
+    # 它依赖 C++ 库在 Windows 上装不上）。grpcio-tools 仅开发期生成协议桩用
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
+    "protobuf>=4.25",
+    # ── 缓存 / 分布式锁 ─────────────────────────────────────────
+    "redis[hiredis]>=5.0",       # L1-L3 三级缓存、取消标记
+    # ── 工具层 ──────────────────────────────────────────────────
+    "mcp>=1.2",                  # MCP Python SDK（search/get_section/check_doc/compare 暴露为 server）
+    # ── 观测 ────────────────────────────────────────────────────
+    "opentelemetry-sdk>=1.26",
+    "opentelemetry-exporter-otlp-proto-http>=1.26",
+    # ── 日志 ────────────────────────────────────────────────────
+    "structlog>=24.1",           # 结构化日志，trace_id 可被 Loki 检索
+    "orjson>=3.10",              # 状态序列化提速（80 项 × 6 步写入频繁）
+    "filelock>=4.2.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "respx>=0.21",               # mock httpx，测 LLM 客户端不联网
+    "mypy>=1.10",
+]
+
+[tool.uv]
+# 关键决策：不把 src/ 打成安装包。
+# 原因：src/ 下的顶层目录名是 agent / rag / models / common —— 都是极通用的名字，
+# 一旦以 editable 方式装进 site-packages，很容易和第三方包撞名（尤其 models）。
+# 所以用 PYTHONPATH=src 的方式运行，pytest 侧由下方 pythonpath 配置解决。
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF", "S"]
+ignore = [
+    "S101",   # 测试里 assert 是正常的
+    "RUF001", # 中文标点不当作歧义字符
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106"]
+# config.py 的 minio/bid 默认值是本地 compose 的开发凭据（.env.example 同源），
+# 不是生产密码；真实凭据只能来自 .env / 环境变量
+"src/common/config.py" = ["S105", "S106"]
+# protobuf 桩代码（grpcio-tools 从官方 proto 自动生成），含二进制描述符、
+# 超长行、非标准 import 顺序，纯生成物，这些 lint 规则对它无意义
+"src/apache/**" = ["E501", "UP009", "I001", "E402", "F401"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+warn_unused_ignores = true
+ignore_missing_imports = true

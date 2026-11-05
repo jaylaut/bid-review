@@ -1,0 +1,78 @@
+# 开发期中间件（不含 Java / Python 进程，它们跑宿主机便于 IDE 调试）
+# 用法：
+#   cd deploy && docker compose up -d
+#   docker compose ps          # 等 postgres 变成 healthy
+#   docker compose logs -f postgres
+name: bid-review
+
+services:
+  postgres:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+      args:
+        PG_MAJOR: "16"
+    image: bid-review/postgres-zhparser:16
+    container_name: bid-pg
+    environment:
+      POSTGRES_USER: bid
+      POSTGRES_PASSWORD: bid
+      POSTGRES_DB: bid_review
+      # 中文环境不做 ICU 排序，避免 collation 不一致导致索引行为异常
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # 首次初始化才执行（volume 已有数据时不会重跑；要重跑需 down -v）
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bid -d bid_review"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: bid-redis
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── RocketMQ 说明 ─────────────────────────────────────────
+  # RocketMQ 5.x 不在本 compose 里跑，改用本机已有安装（E:\CodingTools\rocketmq5.1）
+  # 需手动启动三个进程：NameServer(9876) + Broker(10911) + Proxy(8081)。
+  # 启动命令见 docs/08 环境清单「RocketMQ 本机启动」小节。
+  # 原因：用户机器已有 RocketMQ 5.1.0，本机跑更便于练手调试。
+
+  # ── MinIO 说明 ────────────────────────────────────────────
+  # MinIO 不在本 compose 里跑，独立编排在 deploy/minio/（docker compose up -d）。
+  # 原因：① 凭证走 .env 注入，不明文落 compose 文件；② 数据卷直接映射宿主机
+  # E:/project/bid-review/data/minio，容器删除后数据可见、可备份；③ 镜像用带日期
+  # 的 RELEASE 标签——minio/minio:latest 已被官方废弃，拉取报 not found。
+  # 账号密码与启动步骤见 docs/09-MinIO部署与配置.md。
+
+  # ── 可观测栈说明（Loki + Alloy + Grafana）────────────────────
+  # 日志栈同样不在本 compose 里跑，独立编排在 deploy/observability/：
+  #   cd deploy/observability && docker compose up -d
+  # 原因：① 采集器要读宿主机 review-engine/logs（Python 跑宿主机，不在容器里），
+  #      需要独立的卷映射；② Grafana 管理员密码走该目录 .env；③ 可观测栈可整体
+  #      启停，不该拖累业务中间件的启动顺序。
+  # 采集器用 Grafana Alloy 而非 Promtail（Promtail 2026-03-02 EOL，Loki 3.7.3 起镜像已移除）。
+  # 端口：Loki 3100 / Grafana 3000 / Alloy UI 12345。
+  # 启动步骤、字段契约与排错见 docs/12-日志与可观测栈部署.md。
+
+volumes:
+  pgdata:
+  redisdata:

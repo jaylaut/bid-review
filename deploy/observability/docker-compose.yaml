@@ -1,0 +1,105 @@
+# 日志与可观测栈（Loki + Alloy + Grafana）—— Docker Compose 编排配置
+# 位置：deploy/observability/docker-compose.yaml
+#
+# 启动（默认只起 loki + grafana，Alloy 见下）：
+#   cd deploy/observability && docker compose up -d
+# 容器化采集（alloy 在 profile 里，需显式启用）：
+#   docker compose --profile alloy up -d
+# 停止：   docker compose down（加 -v 会删 named volume，Loki 数据在宿主机不受影响）
+# 查看日志：docker compose logs -f loki
+# 入口：   Grafana  http://localhost:3000 （Explore → Loki）
+#          Loki API http://localhost:3100/ready
+#          Alloy UI http://localhost:12345 （看采集是否正常，比翻日志快）
+#
+# 为什么 Alloy 默认不随 up 起：Windows 开发机上 Python 跑宿主机，Alloy 也跑宿主机
+# 采本地文件最可靠（bind mount 的 inotify 事件会丢）。此时再起 alloy 容器会抢同一份
+# 文件、重复推送。本机形态的启动方式见 alloy/run-windows.ps1 或 docs/12 §启动。
+#
+# 分工（与 deploy/docker-compose.yaml 的关系）：
+#   主 compose 只放"业务依赖"PG / Redis；本目录放"可观测性"，与 MinIO（deploy/minio/）、
+#   RocketMQ（本机三进程）同属项目既有的"独立编排 + docs 手册 + 主 compose 注释指向"模式。
+#   详见 docs/12-日志与可观测栈部署.md。
+#
+# 为什么不是 Promtail：Promtail 于 2026-03-02 EOL，且 Loki 3.7.3 起镜像内已移除该组件；
+# 采集统一走 Grafana Alloy（配置见 ./alloy/config.alloy）。
+#
+# 采集源是宿主机文件而不是 docker socket：Python 进程跑在宿主机（主 compose 开头已说明），
+# docker_sd 只能看到 PG/Redis，采不到业务日志。
+
+name: bid-observability
+
+services:
+  # ── 日志存储与查询 ─────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.7.8
+    container_name: bid-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      # 日志数据落宿主机，容器删除不丢；实际落点 E:/project/bid-review/data/loki
+      - ../../data/loki:/loki
+    # Windows + Docker Desktop 的 bind mount 权限宽松，Loki 镜像默认 uid 10001 写不进去；
+    # 用 root 跑开发环境。Linux 生产部署请去掉本行，改为 chown -R 10001:10001 data/loki。
+    user: "0:0"
+
+  # ── 采集器 ─────────────────────────────────────────────────
+  # 用 profiles 隔离：默认 `docker compose up -d` 只起 loki + grafana；
+  # 容器化采集时显式 `docker compose --profile alloy up -d`。
+  # 原因：Windows 开发机上 Python 与 Alloy 都跑宿主机（采集本地文件最可靠，见 docs/12 §本机形态），
+  # 此时再起一个 alloy 容器会去抢同一份文件、重复推送。
+  alloy:
+    image: grafana/alloy:v1.21.2
+    container_name: bid-alloy
+    profiles: ["alloy"]
+    restart: unless-stopped
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+    environment:
+      # 与 alloy/config.alloy 里的 sys.env 对应；容器内的路径由下面的卷映射决定
+      LOG_PATH: /var/log/bid-review/review-engine.log
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+    ports:
+      - "12345:12345"
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # 采集源：宿主机 review-engine/logs（即 .env 里 LOG_DIR 的落点）
+      - ../../review-engine/logs:/var/log/bid-review:ro
+      # positions（读到文件哪个位置了）必须持久化，否则重启会重复推送/漏读
+      - alloydata:/var/lib/alloy/data
+    depends_on:
+      - loki
+
+  # ── 可视化与查询 ───────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:13.2.2
+    container_name: bid-grafana
+    restart: unless-stopped
+    environment:
+      # 账号密码走同目录 .env，不明文写进本文件（与 deploy/minio/ 的做法一致）
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # 内网部署：关掉外联上报与更新检查
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      # 数据源自动装配：容器起来就自带 Loki 数据源，不用手工点（可复现）
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # Grafana 用 SQLite，放 named volume 而不是 Windows bind mount
+      # （SQLite 在 bind mount 上容易出现 database is locked）
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      - loki
+
+volumes:
+  alloydata:
+  grafanadata:

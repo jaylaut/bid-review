@@ -1,0 +1,2 @@
+1.headers = re.findall(r"^#{1,6}\s",md,flags=re.MULTILINE) -- flags=re.MULTILINE 什么意思？另外 这个正则具体什么意思，请给出示例。
+2.watermark_count = len(re.findall(r"(机密|内部资料|严禁外传)", md)) -- 为什么只有【机密|内部资料|严禁外传】三种情况，覆盖的太少
