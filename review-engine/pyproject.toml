@@ -37,6 +37,7 @@ dependencies = [
     "structlog>=24.1",           # 结构化日志，trace_id 可被 Loki 检索
     "orjson>=3.10",              # 状态序列化提速（80 项 × 6 步写入频繁）
     "filelock>=4.2.6",
+    "pypdf>=6.21.4",
 ]
 
 [dependency-groups]
