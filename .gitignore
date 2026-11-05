@@ -29,7 +29,9 @@ logs/
 *.log
 
 # ── 解析中间产物 ──────────────────────────────────────────
-# MinerU 每份标书会在 _mineru 下写 markdown + 图片 + 版面 JSON，几个 GB 起
+# MinerU 每份标书会写 markdown + 图片 + 版面 JSON，几个 GB 起。
+# 实际位置是 data/_mineru（ParseConfig.mineru_work_dir 由 parsed_dir 的上一级派生）
+data/_mineru/
 data/parsed/_mineru/
 
 # ── 系统文件 ──────────────────────────────────────────────

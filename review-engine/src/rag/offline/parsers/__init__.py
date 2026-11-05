@@ -11,20 +11,19 @@ import re
 from pathlib import Path
 
 from common.errors import ConfigError
-from rag.offline.parsers.mineru import build_command, find_cli, locate_markdown, parse_with_mineru
+from rag.offline.parsers.mineru import check_available, parse_with_mineru, tier_for_backend
 from rag.offline.parsers.route import ParseRoute, detect_route, sample_pages
 
 # 显式声明对外接口。调用方和 IDE 都靠它知道这个包提供什么。
 __all__ = [
     "ParseRoute",
-    "build_command",
+    "check_available",
     "detect_route",
-    "find_cli",
-    "locate_markdown",
     "normalize_markdown",
     "parse_plain_text",
     "parse_with_mineru",
     "sample_pages",
+    "tier_for_backend",
 ]
 
 # 标题行：行首 1~6 个 #，后面必须跟空白。

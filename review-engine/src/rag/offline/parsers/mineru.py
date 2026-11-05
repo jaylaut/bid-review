@@ -1,211 +1,167 @@
-"""MinerU 调用。走命令行，不碰它的内部 Python 类。
+"""MinerU 解析接入。
 
-为什么用 CLI 而不是 import：magic-pdf 1.x 是 Pipeline(doc_bytes=...)，2.x 换成
-PymuDocDataset + doc_analyze，内部类名中途改过。命令行入口一直是 `-p 输入 -o 输出`，
-两个版本都保留，是最稳的调用方式。
+这里不直接 import mineru 干活，而是起一个子进程调 `mineru_worker`。原因写在
+`mineru_worker.py` 顶部：SDK 没有超时、内存峰值大、原生库崩了会连坐主进程。
 
-代价是要自己处理两件事：产物到底落在哪个文件、以及卡住不返回怎么办。都在下面处理。
+为什么不用 MinerU 自带的 `mineru` 命令：4.x 的 CLI 换了架构，`mineru parse` 是客户端，
+`basic`/`standard` 档要连本地 parse-server（不启就报 "Local parse-server is disabled"），
+而且参数在 2.x、3.x、4.x 之间改过两轮。走 SDK 的 `mineru.parse()` 是官方 Python 入口，
+不依赖服务端，也不用跟着 CLI 参数变。
 """
 from __future__ import annotations
 
 import locale
-import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from common.errors import ConfigError, UpstreamError
 
-__all__ = ["build_command", "find_cli", "locate_markdown", "parse_with_mineru"]
+__all__ = ["check_available", "parse_with_mineru", "tier_for_backend"]
 
-# 2.x 的入口名。包名也从 magic-pdf 改成了 mineru。
-_CLI_V2 = "mineru"
-# 1.x 的入口名。
-_CLI_V1 = "magic-pdf"
+# 项目的 src 目录：本文件在 src/rag/offline/parsers/ 下，往上第四级就是 src。
+_SRC_DIR = Path(__file__).resolve().parents[3]
 
-# MinerU 2.x 移除了内置的 LibreOffice 转换，Office 格式需要先转 PDF。
-# 这里不强行拦截（不同版本行为有差异），只在报错时给提示。
-_OFFICE_SUFFIXES = {".doc", ".docx"}
+# 解析后端 → MinerU 4.x 的档位。
+# mineru     ：文本型 PDF，走 onnx 小模型（版面 + OCR + 表格），4 GB 显存或纯 CPU 都能跑；
+# mineru-vlm ：扫描件，要视觉模型，官方门槛是 8 GB 显存 + Turing 架构。
+# 映射放在这里而不是配置文件：它跟本模块的实现绑定，换解析器时一起改才不容易漏。
+_TIER_BY_BACKEND = {
+    "mineru": "basic",
+    "mineru-vlm": "advanced",
+}
 
 
-def _venv_script(name: str) -> list[Path]:
-    """列出当前解释器所在目录下的可执行文件候选路径。
+def check_available() -> None:
+    """确认 mineru 已安装。
 
-    为什么要这一步：用 `uv run` 跑时，虚拟环境的 Scripts 目录会被加进 PATH，
-    shutil.which 能找到 mineru；但直接用 `.venv/Scripts/python.exe` 跑，
-    PATH 里没有这个目录，which 就找不到已经装好的命令。
-    补一次"跟当前解释器同目录"的探测，两种情况都能用。
-
-    name 是不带后缀的命令名。
+    单独抽出来，是为了让调用方能在跑批量之前先探一次，
+    而不是跑到第 37 份才发现依赖没装。
     """
-    # 当前解释器所在目录：虚拟环境里就是 Scripts（Windows）或 bin（Linux/macOS）。
-    bin_dir = Path(sys.executable).parent
-    # Windows 上 pip 装出来的命令带 .exe，Unix 上不带。
-    if sys.platform == "win32":
-        return [bin_dir / f"{name}.exe", bin_dir / name]
-    return [bin_dir / name]
+    try:
+        # 只验证可导入，不在这个函数里调用解析。
+        import mineru  # noqa: F401
+    except ImportError as exc:
+        raise ConfigError('没装 mineru。在 review-engine/ 下执行：uv add "mineru[core]"。') from exc
 
 
-def find_cli() -> tuple[str, int]:
-    """找可用的 MinerU 命令。
+def tier_for_backend(backend: str) -> str:
+    """把内部后端名换成 MinerU 档位。
 
-    返回 (可执行文件路径, 大版本号)。版本号只用来决定参数怎么写。
-    找不到就抛 ConfigError 并给出安装命令，不要丢一个裸 FileNotFoundError 出去。
+    backend 是本项目自己的叫法（mineru / mineru-vlm），与厂商的 tier 名分开，
+    换解析器时只改上面那张表。不认识的 backend 直接报错，不回落默认档——
+    回落会让扫描件用文本档跑，出来一堆空页还不报错。
     """
-    # 先找 2.x：PATH 里找，再找解释器同目录。
-    for candidate in [shutil.which(_CLI_V2), *[str(p) for p in _venv_script(_CLI_V2)]]:
-        if candidate and Path(candidate).is_file():
-            return candidate, 2
-
-    # 再找 1.x，顺序同上。
-    for candidate in [shutil.which(_CLI_V1), *[str(p) for p in _venv_script(_CLI_V1)]]:
-        if candidate and Path(candidate).is_file():
-            return candidate, 1
-
-    # 一个都没有。报错里给出能直接照抄的命令，而不是只说"找不到"。
-    raise ConfigError(
-        "没找到 MinerU 命令行。在 review-engine/ 下执行：uv add mineru（2.x）"
-        "或 uv add magic-pdf==1.3.12（1.x）。\n"
-        "只想先调下游（清洗/分块/检索）的话，把 .txt 放进项目目录走纯文本通道即可。"
-    )
-
-
-def build_command(exe: str, major: int, source: Path, out_dir: Path, backend: str) -> list[str]:
-    """拼命令行参数。
-
-    exe 是可执行文件路径，major 是大版本号，source 是待解析文件，
-    out_dir 是输出目录，backend 是 mineru / mineru-vlm。
-
-    返回列表而不是字符串：不经过 shell，路径里的空格、中文、括号都不用转义。
-    """
-    # 2.x：-b 选后端。pipeline 是常规版面分析，vlm 是视觉模型，能处理扫描件。
-    if major >= 2:
-        mode = "vlm" if backend == "mineru-vlm" else "pipeline"
-        return [exe, "-p", str(source), "-o", str(out_dir), "-b", mode]
-
-    # 1.x：-m 选方法。auto 让 MinerU 自己判，ocr 强制走 OCR。
-    mode = "ocr" if backend == "mineru-vlm" else "auto"
-    return [exe, "-p", str(source), "-o", str(out_dir), "-m", mode]
+    try:
+        return _TIER_BY_BACKEND[backend]
+    except KeyError as exc:
+        raise ConfigError(f"未知解析后端：{backend}（可选 {list(_TIER_BY_BACKEND)}）") from exc
 
 
 def _decode(raw: bytes | None) -> str:
     """把子进程输出解成文本。
 
-    Windows 中文系统的命令行默认输出 GBK，Linux/macOS 是 UTF-8。
-    写死 utf-8 会把中文日志解成一堆问号，排查时等于没有日志。
-    依次试几种编码，全失败就用替换符，保证一定有字符串返回。
+    Windows 中文控制台默认 GBK，Linux 是 UTF-8，写死一种就会把中文日志变成问号。
+    依次尝试，全失败用替换符，保证一定返回字符串。
     """
-    # 没有输出直接返回空串。
     if not raw:
         return ""
-    # 逐个尝试：先 utf-8（MinerU 自己写日志多用这个），再系统默认，最后 gbk。
     for encoding in ("utf-8", locale.getpreferredencoding(False), "gbk"):
         try:
             return raw.decode(encoding)
         except (UnicodeDecodeError, LookupError):
             continue
-    # 都失败：用替换符解，至少保留能看懂的部分。
     return raw.decode("utf-8", errors="replace")
-
-
-def locate_markdown(out_dir: Path, source_stem: str) -> Path:
-    """在输出目录里找 MinerU 产出的正文 markdown。
-
-    MinerU 的输出层级是 <out>/<文件名主干>/<后端>/<文件名主干>.md，但后端目录名
-    （auto / pipeline / vlm / hybrid）和层级在版本之间变过，硬编码路径迟早失效。
-
-    所以先按文件名找：正文一定和源文件同名。名字对不上（MinerU 改过命名规则）
-    再退回"体积最大的 .md"——图片是 .jpg、中间结果是 .json，正文必然是最大的那个 .md。
-
-    out_dir 是输出根目录，source_stem 是源文件名去掉后缀。
-    """
-    # 递归收集所有 md。rglob 返回生成器，这时还没真正遍历目录。
-    md_paths = out_dir.rglob("*.md")
-
-    # 过滤出真正的文件。rglob 匹配的是路径，同名的目录也会被匹配到。
-    candidates: list[Path] = []
-    for path in md_paths:
-        if path.is_file():
-            candidates.append(path)
-
-    # 一个都没有：CLI 参数不对、文件加密、或模型没下载，都可能是原因。
-    if not candidates:
-        raise UpstreamError(
-            f"MinerU 没产出 markdown：{out_dir}",
-            details={"out_dir": str(out_dir)},
-            retriable=False,
-        )
-
-    # 第一优先：文件名正好等于源文件主干。这条不依赖目录层级，最可靠。
-    for path in candidates:
-        if path.stem == source_stem:
-            return path
-
-    # 第二优先：体积最大的那个。排完序取第一个。
-    candidates.sort(key=lambda item: item.stat().st_size, reverse=True)
-    return candidates[0]
 
 
 def parse_with_mineru(
     source: Path,
     *,
-    work_dir: Path,
     backend: str,
     timeout_s: int,
+    work_dir: Path,
 ) -> str:
-    """用 MinerU 解析一份文件，返回 markdown 文本。
+    """解析一份文档，返回 markdown 文本。
 
-    source 是待解析文件，work_dir 是输出根目录（每份文件在其下占一个子目录），
-    backend 是 mineru / mineru-vlm，timeout_s 是单份超时秒数。
+    source    待解析文件（pdf / docx / pptx / xlsx / 图片）。
+    backend   本项目的后端名，mineru 或 mineru-vlm。
+    timeout_s 单份超时秒数，到点子进程会被 kill。
+    work_dir  中间产物目录，每份文件产出同名 .md。
 
-    异常：ConfigError（没装）、UpstreamError（超时 / 没产物 / 返回码非 0）。
+    失败抛 ConfigError（没装）或 UpstreamError（超时 / 崩了 / 空产物）。
     """
-    # 找命令行，同时拿到大版本号，后面拼参数要用。
-    exe, major = find_cli()
+    # 先确认依赖在，避免起了子进程才发现缺包。
+    check_available()
 
-    # 每份文件单独一个输出目录，避免同名文件（不同项目里都叫"招标文件.pdf"）互相覆盖。
-    out_dir = work_dir / source.stem
+    # 档位映射：不认识的 backend 在进子进程之前就炸掉。
+    tier = tier_for_backend(backend)
 
-    # 先建目录。MinerU 不会自己建父目录，传一个不存在的路径会直接报错。
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # 产物路径固定为 <work_dir>/<源文件主干>.md，父子进程都知道它在哪，不用去猜。
+    target = work_dir / f"{source.stem}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
 
-    # 拼参数。
-    command = build_command(exe, major, source, out_dir, backend)
+    # 子进程要能找到 rag 包。项目没把 src 装成包（pyproject 里 package = false），
+    # 所以显式拼 PYTHONPATH，把 src 放最前面。
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{_SRC_DIR}{os.pathsep}{existing}" if existing else str(_SRC_DIR)
 
-    # 调子进程。capture_output 把 stdout/stderr 收进内存，
-    # 不打印到控制台——批量跑 52 份时，MinerU 的输出会把终端刷爆。
+    # 用当前解释器起子进程，保证父子同一个 venv。
+    command = [
+        sys.executable,
+        "-m",
+        "rag.offline.parsers.mineru_worker",
+        str(source),
+        tier,
+        str(target),
+    ]
+
     try:
-        result = subprocess.run(  # noqa: S603  参数是列表、exe 来自 which，没有 shell 注入面
+        result = subprocess.run(  # noqa: S603  参数是列表，没有 shell 注入面
             command,
             capture_output=True,
             timeout=timeout_s,
+            env=env,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        # 超时单独报。同一个文件重试大概率还是超时，所以标成不可重试。
+        # 超时通常是文件本身有问题（损坏、页数过多、渲染卡死），重试大概率还是超时。
         raise UpstreamError(
-            f"MinerU 解析超时（{timeout_s}s）：{source.name}",
-            details={"source": str(source)},
+            f"解析超时（{timeout_s}s）：{source.name}",
+            details={"source": str(source), "tier": tier},
             retriable=False,
         ) from exc
 
-    # 返回码非 0：把 stderr 最后几百个字符带进异常。
-    # 不带的话，日志里只剩"返回码 1"，什么信息都没有。
+    # 非 0 返回码：把 stderr 尾部带出来。只报"失败"没有意义，得知道崩在哪一步。
     if result.returncode != 0:
-        tail = _decode(result.stderr)[-800:]
-        hint = ""
-        # Office 格式在 2.x 上经常直接失败（内置 LibreOffice 被移除了），
-        # 单独补一句提示，省得去猜是文件坏了还是环境问题。
-        if major >= 2 and source.suffix.lower() in _OFFICE_SUFFIXES:
-            hint = "\n提示：MinerU 2.x 不支持直接解析 Office 文档，先用 LibreOffice 转成 PDF。"
         raise UpstreamError(
-            f"MinerU 返回码 {result.returncode}：{source.name}{hint}",
-            details={"source": str(source), "stderr_tail": tail},
+            f"MinerU 解析失败（退出码 {result.returncode}）：{source.name}",
+            details={
+                "source": str(source),
+                "tier": tier,
+                "stderr_tail": _decode(result.stderr)[-800:],
+            },
             retriable=False,
         )
 
-    # 找产物。
-    markdown_path = locate_markdown(out_dir, source.stem)
+    # 子进程说成功但文件不存在，说明协议被破坏，同样按失败处理。
+    if not target.is_file():
+        raise UpstreamError(
+            f"解析进程没有写出产物：{source.name}",
+            details={"expected": str(target)},
+            retriable=False,
+        )
 
-    # 读出来。errors="ignore"：MinerU 偶尔会在正文里留非法字节，不能因此整份读不出。
-    return markdown_path.read_text(encoding="utf-8", errors="ignore")
+    # 读回 markdown。坏字节忽略：一个坏字符不该让整份文档读不出来。
+    markdown = target.read_text(encoding="utf-8", errors="ignore")
+
+    # 空产物等于没解析成功（整份都是图、或解析器提前退出），不能当正常结果放过去。
+    if not markdown.strip():
+        raise UpstreamError(
+            f"解析产物为空：{source.name}",
+            details={"source": str(source), "tier": tier},
+            retriable=False,
+        )
+
+    return markdown

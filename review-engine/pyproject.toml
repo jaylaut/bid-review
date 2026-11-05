@@ -38,6 +38,7 @@ dependencies = [
     "orjson>=3.10",              # 状态序列化提速（80 项 × 6 步写入频繁）
     "filelock>=4.2.6",
     "pypdf>=6.21.4",
+    "mineru[core]>=4.1.7",
 ]
 
 [dependency-groups]
