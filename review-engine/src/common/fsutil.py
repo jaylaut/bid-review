@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """文件落盘的原子写。
 
 直接 open(path, "w") 会先把目标截断成 0 字节再写。写到一半进程被 kill 或断电，
@@ -11,12 +10,16 @@
 from __future__ import annotations
 
 import os
-import tempfile                     # 导入临时文件工具：用到 tempfile.mkstemp（安全地创建唯一命名的临时文件）
-from contextlib import suppress     # 导入 suppress 上下文管理器：忽略指定异常（用于删临时文件时容忍"文件已不存在"）
+import tempfile  # 导入临时文件工具：用到 tempfile.mkstemp（安全地创建唯一命名的临时文件）
+from contextlib import (
+    suppress,  # 导入 suppress 上下文管理器：忽略指定异常（用于删临时文件时容忍"文件已不存在"）
+)
 from pathlib import Path
 
-_RETRIES = 3                        # 模块级常量：os.replace 失败时的最大重试次数（只在 PermissionError 时重试）
-_BACKOFF = 0.05                      # 模块级常量：重试退避基数（秒）。指数退避：0.05s、0.1s、0.2s……
+# 模块级常量：os.replace 失败时的最大重试次数（只在 PermissionError 时重试）
+_RETRIES = 3
+# 模块级常量：重试退避基数（秒）。指数退避：0.05s、0.1s、0.2s……
+_BACKOFF = 0.05
 
 def _replace(tmp_name: str,path: Path) -> None:
     '''
@@ -34,13 +37,14 @@ def _replace(tmp_name: str,path: Path) -> None:
             os.replace(tmp_name,path)
             return
         except PermissionError:
-            # 只捕 PermissionError：Windows 上若目标文件正被其它进程占用（杀毒扫描、编辑器打开、另一 worker 在读），
-            # 重命名会瞬时失败，等一会儿再试大概率能成
+            # 只捕 PermissionError：Windows 上若目标文件正被其它进程占用
+            # （杀毒扫描、编辑器打开、另一 worker 在读），重命名会瞬时失败，等一会儿再试大概率能成
             if attempt == _RETRIES - 1: # 如果这是最后一次尝试
                 raise                    # 不再吞掉，把异常原样抛给调用方——重试 3 次仍失败说明不是瞬时问题
-            import time                  # 只在需要等待时才导入 time（延迟导入，成功路径不付出导入成本）
+            import time  # 只在需要等待时才导入 time（延迟导入，成功路径不付出导入成本）
 
-            time.sleep(_BACKOFF * (2 ** attempt))    # 指数退避后重试：第 0 次失败等 0.05s，第 1 次等 0.1s，第 2 次等 0.2s
+            # 指数退避后重试：第 0 次失败等 0.05s，第 1 次等 0.1s，第 2 次等 0.2s
+            time.sleep(_BACKOFF * (2 ** attempt))
 
 def write_text_atomic(path: Path,text: str) -> None:
     '''
@@ -52,7 +56,8 @@ def write_text_atomic(path: Path,text: str) -> None:
 
     # mkstemp 自带随机后缀，多进程同时写同一目录不会重名
     # 在 path 所在目录（dir=...，保证同目录，后续 os.replace 才能原子替换）创建一个临时文件：
-    #   prefix=".文件名." → 临时文件形如 .ledger.json.ab12cd34.tmp，以 . 开头不污染目录列表，且能看出是谁的临时文件
+    #   prefix=".文件名." → 临时文件形如 .ledger.json.ab12cd34.tmp
+    #   以 . 开头不污染目录列表，且能看出是哪个文件的临时产物
     #   返回值：fd 是已打开文件的"裸文件描述符"（整数句柄），tmp_name 是临时文件的路径字符串
     fd,tmp_name = tempfile.mkstemp(dir=str(path.parent),prefix=f".{path.name}.",suffix=".tmp")
     try:
@@ -64,7 +69,8 @@ def write_text_atomic(path: Path,text: str) -> None:
         #   保证本文件写出的文本在所有平台上都是统一 LF 换行
         with os.fdopen(fd,"w",encoding="utf-8",newline="\n") as f:
             f.write(text)            # 把整段文本写入临时文件（此刻还写的是操作系统的页缓存，未必已到磁盘）
-            f.flush()                # 把 Python 层缓冲区的数据交给操作系统——flush 只代表"交给 OS"，不代表已落盘
+            f.flush()                # 把 Python 层缓冲区的数据交给操作系统
+            # 注意：flush 只代表"交给 OS"，不代表已落盘
             # 真正的落盘指令：命令操作系统把该文件描述符对应的数据+元数据强制刷到磁盘。
             # 没有这一步，断电/系统崩溃时即使 write 成功磁盘上仍可能是半截。
             # 这是三步 atomic write 中"fsync"那一步

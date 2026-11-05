@@ -29,13 +29,13 @@ from typing import Any
 # 显式导出，避免 `from common.errors import *` 时把内部辅助量也带出去。
 __all__ = [
     "AppError",
-    "ToolError",
-    "PermissionDenied",
-    "LockHeld",
-    "UpstreamError",
-    "StorageError",
-    "ContractViolation",
     "ConfigError",
+    "ContractViolation",
+    "LockHeld",
+    "PermissionDenied",
+    "StorageError",
+    "ToolError",
+    "UpstreamError",
 ]
 
 
